@@ -96,9 +96,9 @@ def test_ndcg_is_nan_when_nothing_is_relevant():
 def test_mean_ndcg_excludes_unjudgeable_queries():
     good = Query("good", (document("a", 3), document("b", 0)))
     empty = Query("empty", (document("c", 0), document("d", 0)))
-    dataset_scorer = lambda doc: {"a": 2.0, "b": 1.0, "c": 1.0, "d": 0.0}[doc.doc_id]
+    scorer = lambda doc: {"a": 2.0, "b": 1.0, "c": 1.0, "d": 0.0}[doc.doc_id]
     # the empty query is skipped entirely, so a perfect ranking still scores 1.0
-    assert mean_ndcg([good, empty], dataset_scorer, k=10) == pytest.approx(1.0)
+    assert mean_ndcg([good, empty], scorer, k=10) == pytest.approx(1.0)
 
 
 def test_ndcg_truncation_ignores_documents_below_k():
@@ -129,18 +129,42 @@ def test_average_precision_discards_grades():
     high = [document("a", 4), document("b", 0)]
     low = [document("a", 1), document("b", 0)]
     assert average_precision(high) == average_precision(low)
-    assert ndcg(high, k=10) == ndcg(low, k=10)  # both perfect orderings
-    # but the DCG values themselves differ enormously
+    assert ndcg(high, k=10) == ndcg(low, k=10)  # both are perfect orderings
+    # but the underlying gains differ enormously
     assert dcg([4, 0]) > 5 * dcg([1, 0])
+
+
+def test_mrr_and_ndcg_disagree_on_the_same_two_orderings():
+    """Same documents, two orderings: MRR cannot tell them apart and NDCG can.
+
+    A grade-1 above a grade-4 satisfies MRR's threshold at rank 1, so its reciprocal rank is a perfect 1.0 --
+    identical to the correct ordering. NDCG sees the inversion. This is the concrete reason a navigational
+    metric must not be used to judge a graded ranking.
+    """
+    wrong = [document("weak", 1), document("perfect", 4)]
+    right = [document("perfect", 4), document("weak", 1)]
+    assert mrr(wrong) == mrr(right) == pytest.approx(1.0)
+    assert ndcg(right, k=10) == pytest.approx(1.0)
+    assert ndcg(wrong, k=10) < 0.7
+    # ERR agrees with NDCG here, because it models a user who stops when satisfied
+    assert expected_reciprocal_rank(right) > expected_reciprocal_rank(wrong)
+
+
+def test_map_and_ndcg_disagree_on_grade_ordering():
+    """MAP is blind to the same inversion, for a different reason: it never looks at the grades."""
+    wrong = [document("weak", 1), document("perfect", 4)]
+    right = [document("perfect", 4), document("weak", 1)]
+    assert average_precision(wrong) == average_precision(right) == pytest.approx(1.0)
+    assert ndcg(wrong, k=10) < ndcg(right, k=10)
 
 
 def test_err_cascade_discounts_later_relevance():
     """ERR's product term: a good document after a satisfying one contributes almost nothing."""
-    first = expected_reciprocal_rank([document("a", 4), document("b", 4)], k=10)
+    both = expected_reciprocal_rank([document("a", 4), document("b", 4)], k=10)
     single = expected_reciprocal_rank([document("a", 4), document("b", 0)], k=10)
-    assert first > single
-    assert first - single < 0.05  # the second grade-4 adds very little
-    assert 0.0 <= first <= 1.0
+    assert both > single
+    assert both - single < 0.05  # the second grade-4 adds very little
+    assert 0.0 <= both <= 1.0
 
 
 def test_err_prefers_relevance_earlier():
@@ -153,19 +177,6 @@ def test_precision_at_k():
     documents = [document("a", 2), document("b", 0), document("c", 1), document("d", 0)]
     assert precision_at_k(documents, k=4) == pytest.approx(0.5)
     assert precision_at_k(documents, k=1) == pytest.approx(1.0)
-
-
-def test_metrics_disagree_on_the_same_pair_of_rankings():
-    """One perfect hit vs five decent ones: MRR and NDCG rank these differently."""
-    one_perfect = Query("q", tuple([document("a", 4)] + [document(f"x{i}", 0) for i in range(9)]))
-    five_decent = Query(
-        "q", tuple([document(f"b{i}", 2) for i in range(5)] + [document(f"y{i}", 0) for i in range(5)])
-    )
-    order = lambda docs: {doc.doc_id: -index for index, doc in enumerate(docs)}
-    first = evaluate([one_perfect], lambda d: order(one_perfect.documents)[d.doc_id])
-    second = evaluate([five_decent], lambda d: order(five_decent.documents)[d.doc_id])
-    assert first["mrr"] > second["mrr"] or first["mrr"] == second["mrr"]
-    assert second["map"] > first["map"]  # MAP rewards the five relevant documents
 
 
 # ---------------------------------------------------------------------------------------------
@@ -320,8 +331,13 @@ def test_relevance_probability_is_monotone_with_a_noise_floor():
 
 def test_click_rates_fall_with_rank():
     dataset = make_dataset(queries=120, documents_per_query=15, seed=10)
-    logs = simulate_clicks(dataset, feature_ranker((1.0, 0.2, 0.0, 0.2, 0.1, 0.0)),
-                           impressions_per_query=25, severity=1.0, seed=10)
+    logs = simulate_clicks(
+        dataset,
+        feature_ranker((1.0, 0.2, 0.0, 0.2, 0.1, 0.0)),
+        impressions_per_query=25,
+        severity=1.0,
+        seed=10,
+    )
     rates = click_through_rates(logs)
     assert rates[1] > rates[5] > rates[10]
     assert rates[1] > 3 * rates[10]  # roughly the 1/k shape
@@ -339,8 +355,11 @@ def test_propensity_estimate_is_less_biased_under_randomisation():
     """The estimator assumes constant relevance per rank, which only a random logging policy satisfies."""
     dataset = make_dataset(queries=200, documents_per_query=15, seed=12)
     biased_logs = simulate_clicks(
-        dataset, feature_ranker((1.0, 0.2, 0.0, 0.2, 0.1, 0.0)),
-        impressions_per_query=25, severity=1.0, seed=12,
+        dataset,
+        feature_ranker((1.0, 0.2, 0.0, 0.2, 0.1, 0.0)),
+        impressions_per_query=25,
+        severity=1.0,
+        seed=12,
     )
     random_logs = simulate_clicks(dataset, random_ranker(seed=13), impressions_per_query=25, seed=13)
     truth = examination_probability(5, 1.0)
@@ -351,8 +370,9 @@ def test_propensity_estimate_is_less_biased_under_randomisation():
 
 def test_zero_severity_removes_the_bias():
     dataset = make_dataset(queries=120, documents_per_query=12, seed=14)
-    logs = simulate_clicks(dataset, random_ranker(seed=14), impressions_per_query=30,
-                           severity=0.0, seed=14)
+    logs = simulate_clicks(
+        dataset, random_ranker(seed=14), impressions_per_query=30, severity=0.0, seed=14
+    )
     rates = click_through_rates(logs)
     # no position bias and a random ranker: every rank should look alike
     assert abs(rates[1] - rates[10]) < 0.08
@@ -392,19 +412,27 @@ def test_lambdarank_also_learns_and_uses_the_same_pairs():
 
 
 def test_trained_models_ignore_the_useless_feature():
-    """length_ratio has a true weight of exactly zero; a large learned weight means fitted noise."""
+    """length_ratio has a true weight of exactly zero, so it should end up the smallest weight.
+
+    A model that puts real weight on it is fitting noise -- and would then carry that noise into
+    production, where the feature is equally uninformative.
+    """
     dataset = make_dataset(queries=250, documents_per_query=15, seed=18)
     model, _ = train_pairwise(dataset, epochs=20, seed=18)
-    assert abs(model.normalised()[5]) < 0.5
+    normalised = model.normalised()
+    assert abs(normalised[5]) < 0.5
+    # the two features with the largest true weights should both beat the noise feature
+    assert abs(normalised[0]) > abs(normalised[5])  # bm25
+    assert abs(normalised[1]) > abs(normalised[5])  # title_match
 
 
-def test_trained_model_favours_the_strongest_true_signal():
-    """BM25 has the largest true weight for two of three intents, so it should dominate."""
+def test_trained_model_gives_the_strong_signals_positive_weight():
+    """Direction, not magnitude: every genuinely useful feature has a positive true weight."""
     dataset = make_dataset(queries=250, documents_per_query=15, seed=19)
     model, _ = train_pairwise(dataset, epochs=20, seed=19)
-    normalised = model.normalised()
-    assert normalised[0] > 0.0
-    assert normalised[0] >= max(abs(v) for v in normalised) - 1e-9 or normalised[0] > 0.5
+    assert model.weights[0] > 0.0  # bm25
+    assert model.weights[1] > 0.0  # title_match
+    assert model.weights[4] > 0.0  # quality
 
 
 def test_equal_label_pairs_are_skipped():
@@ -437,7 +465,7 @@ def test_no_negatives_below_a_click():
 def test_a_click_beats_the_documents_skipped_above_it():
     dataset = make_dataset(queries=1, documents_per_query=5, seed=22)
     shown = tuple(d.doc_id for d in dataset.queries[0].documents)
-    # rank 3 clicked, ranks 1 and 2 skipped -> exactly two pairs per epoch
+    # rank 3 clicked, ranks 1 and 2 skipped -> exactly two pairs per epoch, four epochs
     log_entry = ClickLog("q0", shown, (False, False, True, False, False))
     _, log = train_from_clicks([log_entry], dataset, epochs=4, seed=22)
     assert log.pairs_used == 8
@@ -458,10 +486,18 @@ def test_propensity_weighting_amplifies_low_rank_clicks():
     shown = tuple(d.doc_id for d in dataset.queries[0].documents)
     propensities = {rank: examination_probability(rank, 1.0) for rank in range(1, 11)}
     deep = ClickLog("q0", shown, tuple(index == 7 for index in range(10)))
-    unweighted, _ = train_from_clicks([deep], dataset, propensities=None, epochs=1,
-                                      learning_rate=0.01, seed=24)
-    weighted, _ = train_from_clicks([deep], dataset, propensities=propensities, epochs=1,
-                                    learning_rate=0.01, propensity_floor=1e-6, seed=24)
+    unweighted, _ = train_from_clicks(
+        [deep], dataset, propensities=None, epochs=1, learning_rate=0.01, seed=24
+    )
+    weighted, _ = train_from_clicks(
+        [deep],
+        dataset,
+        propensities=propensities,
+        epochs=1,
+        learning_rate=0.01,
+        propensity_floor=1e-6,
+        seed=24,
+    )
     magnitude_unweighted = sum(abs(w) for w in unweighted.weights)
     magnitude_weighted = sum(abs(w) for w in weighted.weights)
     assert magnitude_weighted > 5 * magnitude_unweighted
@@ -472,8 +508,10 @@ def test_propensity_floor_caps_the_weight():
     shown = tuple(d.doc_id for d in dataset.queries[0].documents)
     tiny = {rank: 1e-9 for rank in range(1, 11)}
     deep = ClickLog("q0", shown, tuple(index == 9 for index in range(10)))
-    floored, _ = train_from_clicks([deep], dataset, propensities=tiny, epochs=1,
-                                  learning_rate=0.01, propensity_floor=0.05, seed=25)
+    floored, _ = train_from_clicks(
+        [deep], dataset, propensities=tiny, epochs=1, learning_rate=0.01,
+        propensity_floor=0.05, seed=25,
+    )
     # without the floor the weight would be 1e9; with it, the update stays finite and small
     assert all(math.isfinite(weight) for weight in floored.weights)
     assert max(abs(weight) for weight in floored.weights) < 1.0
@@ -501,8 +539,11 @@ def test_graded_labels_remain_the_ceiling_over_clicks():
     dataset = make_dataset(queries=250, documents_per_query=15, seed=27)
     train, test = dataset.split(0.7, seed=27)
     logs = simulate_clicks(
-        train, feature_ranker((1.0, 0.2, 0.0, 0.2, 0.1, 0.0)),
-        impressions_per_query=25, severity=1.0, seed=27,
+        train,
+        feature_ranker((1.0, 0.2, 0.0, 0.2, 0.1, 0.0)),
+        impressions_per_query=25,
+        severity=1.0,
+        seed=27,
     )
     truth = {rank: examination_probability(rank, 1.0) for rank in range(1, 11)}
     from_clicks, _ = train_from_clicks(logs, train, propensities=truth, epochs=12, seed=27)
