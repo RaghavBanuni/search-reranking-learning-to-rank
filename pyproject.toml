@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "search-reranking-learning-to-rank"
+version = "0.1.0"
+description = "Learning to rank from scratch: ranking metrics, pointwise/pairwise/listwise objectives, and unbiased learning from position-biased click logs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Raghav Banuni" }]
+keywords = ["learning-to-rank", "information-retrieval", "ndcg", "lambdarank", "ranknet", "position-bias", "counterfactual-learning"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# No runtime dependencies at all. Every metric, gradient and propensity estimator is written out
+# in the standard library, because the point of this repository is the derivation -- an import of
+# lightgbm's `lambdarank` objective would hide exactly the part worth reading.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.urls]
+Repository = "https://github.com/RaghavBanuni/search-reranking-learning-to-rank"
+
+[project.scripts]
+ltr = "ltr.cli:main"
+
+[tool.setuptools]
+packages = ["ltr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
